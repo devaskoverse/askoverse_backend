@@ -4,7 +4,11 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 import pickle
 import datetime
+
+from sklearn.metrics.pairwise import cosine_similarity
 import tempfile
+import json
+
 
 # Initialize Firebase Admin
 firebase_admin.initialize_app()
@@ -34,7 +38,8 @@ def train_poll_hashtags_kmeans_model(request):
     # Save the model and vectorizer to Firebase Storage
     model_data = {
         'kmeans': kmeans,
-        'vectorizer': vectorizer
+        'vectorizer': vectorizer,
+        'data': all_polls_hashtags_list
     }
 
     bucket_name = 'askoverse-ml-models-bucket'  # Replace with your bucket name
@@ -59,3 +64,80 @@ def train_poll_hashtags_kmeans_model(request):
 
 
     return 'Model trained and saved successfully.'
+
+
+
+
+def load_model_from_storage(bucket_name, model_path):
+    bucket = storage.bucket(bucket_name)
+    blob = bucket.blob(model_path)
+    
+    with tempfile.NamedTemporaryFile() as temp_model_file:
+        blob.download_to_filename(temp_model_file.name)
+        temp_model_file.seek(0)
+        model_data = pickle.load(temp_model_file)
+    
+    return model_data
+
+def get_top_n_user_hashtags(user_id, n):
+    db = firestore.client()
+    user_hashtags_collection_name = "user_hashtags"
+    doc = db.collection(user_hashtags_collection_name).document(user_id).get()
+
+    if not doc.exists:
+        return []
+
+    return sorted(doc.to_dict().items(), key=lambda item: item[1], reverse=True)[:n]
+
+
+def recommend_user_interest_polls(request):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    no_of_polls = data.get('no_of_polls')
+
+   
+    db = firestore.client()
+    model_path = 'models/latest_model.pkl'
+    
+    # Load the model, vectorizer, and poll_hashtags from Firebase Storage
+    bucket_name = 'askoverse-ml-models-bucket'
+    model_data = load_model_from_storage(bucket_name, model_path)
+
+    
+    
+    kmeans = model_data['kmeans']
+    vectorizer = model_data['vectorizer']
+    all_polls_hashtags_list = model_data['data']
+
+   
+    # Get user preferences
+    user_interest = get_top_n_user_hashtags(user_id, 50)
+    user_preferences = [item[0] for item in user_interest]
+
+   
+
+    if not user_preferences:
+        return json.dumps([])
+
+    # Vectorize user preferences
+    user_pref_vector = vectorizer.transform([user_preferences])
+    user_pref_scores = cosine_similarity(vectorizer.transform([post["hashtags"] for post in all_polls_hashtags_list]), user_pref_vector)
+
+    # Sort posts by relevance to user preferences
+    posts_sorted = sorted(zip(all_polls_hashtags_list, user_pref_scores), key=lambda x: x[1], reverse=True)
+
+    # Example: Get top posts from the most relevant cluster
+    top_cluster = kmeans.predict(user_pref_vector)[0]
+    top_posts_in_cluster = [post for post, score in posts_sorted if kmeans.predict(vectorizer.transform([post["hashtags"]])) == top_cluster]
+
+
+    # Get top 5 posts
+    top_n_posts = []
+    n = no_of_polls
+    for post in top_posts_in_cluster[:n]:
+        post_data = db.collection('polls').document(post['id']).get().to_dict()
+        top_n_posts.append(post['id'])
+
+    return json.dumps(top_n_posts)
+
+
